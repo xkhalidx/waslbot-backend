@@ -561,6 +561,192 @@ app.get('/api/notif-prefs/:phoneNumberId', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════
+// AUTH SYSTEM
+// ══════════════════════════════════════════════════════
+
+async function hashPassword(password) {
+  const encoder = new TextEncoder();
+  const salt = process.env.HASH_SALT || 'waslbot_salt_2025';
+  const data = encoder.encode(password + salt);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+
+function createToken(payload) {
+  const header = Buffer.from(JSON.stringify({alg:'HS256',typ:'JWT'})).toString('base64url');
+  const body   = Buffer.from(JSON.stringify({...payload, exp: Date.now() + 30*24*60*60*1000})).toString('base64url');
+  const secret = process.env.JWT_SECRET || 'waslbot_jwt_secret_2025';
+  const sig    = require('crypto').createHmac('sha256', secret).update(header+'.'+body).digest('base64url');
+  return header+'.'+body+'.'+sig;
+}
+
+function verifyToken(token) {
+  try {
+    const [header, body, sig] = token.split('.');
+    const secret = process.env.JWT_SECRET || 'waslbot_jwt_secret_2025';
+    const expected = require('crypto').createHmac('sha256', secret).update(header+'.'+body).digest('base64url');
+    if (sig !== expected) return null;
+    const payload = JSON.parse(Buffer.from(body,'base64url').toString());
+    if (payload.exp < Date.now()) return null;
+    return payload;
+  } catch { return null; }
+}
+
+function authMiddleware(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ','');
+  if (!token) return res.status(401).json({error:'Unauthorized'});
+  const payload = verifyToken(token);
+  if (!payload) return res.status(401).json({error:'Invalid or expired token'});
+  req.account = payload;
+  next();
+}
+
+function adminMiddleware(req, res, next) {
+  if (!req.account?.is_admin) return res.status(403).json({error:'Admin only'});
+  next();
+}
+
+// ── REGISTER
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, full_name } = req.body;
+    if (!email || !password) return res.status(400).json({error:'Email and password required'});
+    if (password.length < 6) return res.status(400).json({error:'Password must be at least 6 characters'});
+    const existing = await db.getAccount(email);
+    if (existing) return res.status(409).json({error:'Email already registered'});
+    const password_hash = await hashPassword(password);
+    const result = await db.createAccount({email, password_hash, full_name: full_name||'', plan:'basic', is_active:true, is_admin:false});
+    const account = Array.isArray(result) ? result[0] : null;
+    if (!account) return res.status(500).json({error:'Failed to create account'});
+    const token = createToken({id:account.id, email:account.email, plan:account.plan, is_admin:account.is_admin});
+    res.json({success:true, token, account:{id:account.id, email:account.email, full_name:account.full_name, plan:account.plan}});
+  } catch(e) { console.error('Register error:',e); res.status(500).json({error:e.message}); }
+});
+
+// ── LOGIN
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({error:'Email and password required'});
+    const account = await db.getAccount(email);
+    if (!account) return res.status(401).json({error:'Invalid email or password'});
+    if (!account.is_active) return res.status(403).json({error:'Account suspended'});
+    const password_hash = await hashPassword(password);
+    if (password_hash !== account.password_hash) return res.status(401).json({error:'Invalid email or password'});
+    const token = createToken({id:account.id, email:account.email, plan:account.plan, is_admin:account.is_admin});
+    res.json({success:true, token, account:{id:account.id, email:account.email, full_name:account.full_name, plan:account.plan, is_admin:account.is_admin}});
+  } catch(e) { console.error('Login error:',e); res.status(500).json({error:e.message}); }
+});
+
+// ── ME
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  try {
+    const account = await db.getAccount(req.account.email);
+    if (!account) return res.status(404).json({error:'Not found'});
+    const {password_hash, ...safe} = account;
+    const phones = await db.getAccountPhones(account.id);
+    res.json({account:safe, phones: phones.map(({token,...p})=>p)});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// ── CHANGE PASSWORD
+app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
+  try {
+    const {current_password, new_password} = req.body;
+    if (!current_password || !new_password) return res.status(400).json({error:'Both passwords required'});
+    if (new_password.length < 6) return res.status(400).json({error:'Min 6 characters'});
+    const account = await db.getAccount(req.account.email);
+    const currentHash = await hashPassword(current_password);
+    if (currentHash !== account.password_hash) return res.status(401).json({error:'Current password incorrect'});
+    const new_hash = await hashPassword(new_password);
+    await supabase('accounts','PATCH',{password_hash:new_hash, updated_at:new Date().toISOString()},`?id=eq.${account.id}`);
+    res.json({success:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// ══════════════════════════════════════════════════════
+// MULTI-PHONE PER ACCOUNT
+// ══════════════════════════════════════════════════════
+const PLAN_LIMITS = {basic:1, pro:3, enterprise:999};
+
+app.get('/api/my-phones', authMiddleware, async (req, res) => {
+  try {
+    const phones = await db.getAccountPhones(req.account.id);
+    res.json({phones: phones.map(({token,...p})=>p)});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+app.post('/api/my-phones', authMiddleware, async (req, res) => {
+  try {
+    const account = await db.getAccount(req.account.email);
+    const existing = await db.getAccountPhones(account.id);
+    const limit = PLAN_LIMITS[account.plan] || 1;
+    if (existing.length >= limit)
+      return res.status(403).json({error:`باقتك (${account.plan}) تسمح بـ ${limit} رقم فقط — يرجى الترقية`});
+    const {phoneNumberId, token, label, waba_id} = req.body;
+    if (!phoneNumberId || !token) return res.status(400).json({error:'Phone Number ID and Token required'});
+    await db.upsertPhone({
+      phone_number_id:phoneNumberId, account_id:account.id,
+      token, label:label||'', waba_id:waba_id||'',
+      status:'open', ai_enabled:false,
+      default_msg:'شكراً لتواصلك! سنرد عليك قريباً 😊', is_active:true
+    });
+    res.json({success:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+app.delete('/api/my-phones/:phoneNumberId', authMiddleware, async (req, res) => {
+  try {
+    const phone = await db.getPhone(req.params.phoneNumberId);
+    if (!phone) return res.status(404).json({error:'Not found'});
+    if (phone.account_id !== req.account.id && !req.account.is_admin)
+      return res.status(403).json({error:'Not authorized'});
+    await supabase('phone_numbers','PATCH',{is_active:false},`?phone_number_id=eq.${req.params.phoneNumberId}`);
+    res.json({success:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// ══════════════════════════════════════════════════════
+// SUPER ADMIN
+// ══════════════════════════════════════════════════════
+app.get('/api/admin/accounts', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const r = await supabase('accounts','GET',null,'?order=created_at.desc');
+    res.json({accounts:(Array.isArray(r)?r:[]).map(({password_hash,...a})=>a)});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+app.post('/api/admin/accounts/:id/plan', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const {plan} = req.body;
+    if (!['basic','pro','enterprise'].includes(plan)) return res.status(400).json({error:'Invalid plan'});
+    await supabase('accounts','PATCH',{plan, updated_at:new Date().toISOString()},`?id=eq.${req.params.id}`);
+    res.json({success:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+app.post('/api/admin/accounts/:id/status', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const {is_active} = req.body;
+    await supabase('accounts','PATCH',{is_active, updated_at:new Date().toISOString()},`?id=eq.${req.params.id}`);
+    res.json({success:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+app.get('/api/admin/stats', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const accounts = await supabase('accounts','GET',null,'?select=id');
+    const phones   = await supabase('phone_numbers','GET',null,'?select=id&is_active=eq.true');
+    const tickets  = await supabase('tickets','GET',null,'?select=id&status=eq.open');
+    res.json({
+      total_accounts: Array.isArray(accounts)?accounts.length:0,
+      active_phones:  Array.isArray(phones)?phones.length:0,
+      open_tickets:   Array.isArray(tickets)?tickets.length:0
+    });
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// ══════════════════════════════════════════════════════
 // HEALTH CHECK
 // ══════════════════════════════════════════════════════
 app.get('/', async (req, res) => {
@@ -568,9 +754,9 @@ app.get('/', async (req, res) => {
     status: 'WaslBot Backend Running!',
     supabase: !!SUPABASE_URL,
     ai: !!process.env.ANTHROPIC_API_KEY,
-    version: '2.0.0'
+    version: '3.0.0'
   });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`WaslBot v2 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`WaslBot v3 running on port ${PORT}`));
