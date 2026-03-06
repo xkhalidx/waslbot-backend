@@ -606,36 +606,169 @@ function adminMiddleware(req, res, next) {
   next();
 }
 
-// ── REGISTER
+// ── OTP HELPERS ─────────────────────────────────────
+// Store OTPs in memory (expires in 10 min)
+const otpStore = new Map(); // key: email|phone → {otp, exp, data}
+
+function generateOTP() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+async function sendEmailOTP(email, otp, purpose = 'تفعيل الحساب') {
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + process.env.RESEND_API_KEY,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      from: 'WaslBot <noreply@waslbot.net>',
+      to: [email],
+      subject: `رمز التحقق — WaslBot`,
+      html: `
+        <div dir="rtl" style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f9fafb;border-radius:12px">
+          <h2 style="color:#00d4aa;margin-bottom:8px">WaslBot 💬</h2>
+          <p style="color:#374151;font-size:16px;margin-bottom:24px">${purpose}</p>
+          <div style="background:#fff;border:2px solid #00d4aa;border-radius:12px;padding:24px;text-align:center">
+            <p style="color:#6b7280;font-size:14px;margin-bottom:8px">رمز التحقق الخاص بك</p>
+            <h1 style="color:#111827;font-size:42px;letter-spacing:10px;margin:0">${otp}</h1>
+            <p style="color:#9ca3af;font-size:13px;margin-top:12px">صالح لمدة 10 دقائق فقط</p>
+          </div>
+          <p style="color:#9ca3af;font-size:12px;margin-top:24px;text-align:center">إذا لم تطلب هذا الرمز، تجاهل هذا الإيميل</p>
+        </div>`
+    })
+  });
+  const data = await res.json();
+  console.log('Email OTP sent:', data.id || JSON.stringify(data));
+  return data;
+}
+
+// ── REGISTER (Step 1: send OTP)
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, full_name } = req.body;
-    if (!email || !password) return res.status(400).json({error:'Email and password required'});
-    if (password.length < 6) return res.status(400).json({error:'Password must be at least 6 characters'});
+    if (!email || !password) return res.status(400).json({error:'البريد الإلكتروني وكلمة المرور مطلوبان'});
+    if (password.length < 6) return res.status(400).json({error:'كلمة المرور يجب أن تكون 6 أحرف على الأقل'});
     const existing = await db.getAccount(email);
-    if (existing) return res.status(409).json({error:'Email already registered'});
+    if (existing && existing.email_verified) return res.status(409).json({error:'البريد الإلكتروني مسجل مسبقاً'});
+
+    const otp = generateOTP();
     const password_hash = await hashPassword(password);
-    const result = await db.createAccount({email, password_hash, full_name: full_name||'', plan:'basic', is_active:true, is_admin:false});
-    const account = Array.isArray(result) ? result[0] : null;
-    if (!account) return res.status(500).json({error:'Failed to create account'});
+    otpStore.set('reg:' + email, {
+      otp, exp: Date.now() + 10 * 60 * 1000,
+      data: { email, password_hash, full_name: full_name || '' }
+    });
+
+    await sendEmailOTP(email, otp, 'أدخل الرمز التالي لتفعيل حسابك في WaslBot');
+    res.json({ success: true, message: 'تم إرسال رمز التحقق لبريدك الإلكتروني', step: 'verify_email' });
+  } catch(e) { console.error('Register error:', e); res.status(500).json({error: e.message}); }
+});
+
+// ── REGISTER (Step 2: verify OTP)
+app.post('/api/auth/verify-email', async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) return res.status(400).json({error:'البريد والرمز مطلوبان'});
+
+    const stored = otpStore.get('reg:' + email);
+    if (!stored) return res.status(400).json({error:'انتهت صلاحية الرمز — أعد التسجيل'});
+    if (Date.now() > stored.exp) { otpStore.delete('reg:' + email); return res.status(400).json({error:'انتهت صلاحية الرمز'}); }
+    if (stored.otp !== otp.trim()) return res.status(400).json({error:'الرمز غير صحيح'});
+
+    otpStore.delete('reg:' + email);
+    const { data: regData } = stored;
+
+    // Create account
+    const existing = await db.getAccount(email);
+    let account;
+    if (existing) {
+      await supabase('accounts','PATCH',{email_verified:true, password_hash:regData.password_hash, updated_at:new Date().toISOString()},`?id=eq.${existing.id}`);
+      account = {...existing, email_verified:true};
+    } else {
+      const result = await db.createAccount({
+        email: regData.email, password_hash: regData.password_hash,
+        full_name: regData.full_name, plan:'basic',
+        is_active:true, is_admin:false, email_verified:true
+      });
+      account = Array.isArray(result) ? result[0] : null;
+    }
+    if (!account) return res.status(500).json({error:'فشل إنشاء الحساب'});
+
     const token = createToken({id:account.id, email:account.email, plan:account.plan, is_admin:account.is_admin});
     res.json({success:true, token, account:{id:account.id, email:account.email, full_name:account.full_name, plan:account.plan}});
-  } catch(e) { console.error('Register error:',e); res.status(500).json({error:e.message}); }
+  } catch(e) { console.error('Verify email error:', e); res.status(500).json({error:e.message}); }
 });
 
 // ── LOGIN
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({error:'Email and password required'});
+    if (!email || !password) return res.status(400).json({error:'البريد وكلمة المرور مطلوبان'});
     const account = await db.getAccount(email);
-    if (!account) return res.status(401).json({error:'Invalid email or password'});
-    if (!account.is_active) return res.status(403).json({error:'Account suspended'});
+    if (!account) return res.status(401).json({error:'البريد أو كلمة المرور غير صحيحة'});
+    if (!account.is_active) return res.status(403).json({error:'الحساب موقوف'});
+    if (!account.email_verified) return res.status(403).json({error:'البريد الإلكتروني غير مفعّل — يرجى التحقق من بريدك'});
     const password_hash = await hashPassword(password);
-    if (password_hash !== account.password_hash) return res.status(401).json({error:'Invalid email or password'});
+    if (password_hash !== account.password_hash) return res.status(401).json({error:'البريد أو كلمة المرور غير صحيحة'});
     const token = createToken({id:account.id, email:account.email, plan:account.plan, is_admin:account.is_admin});
     res.json({success:true, token, account:{id:account.id, email:account.email, full_name:account.full_name, plan:account.plan, is_admin:account.is_admin}});
   } catch(e) { console.error('Login error:',e); res.status(500).json({error:e.message}); }
+});
+
+// ── RESEND OTP
+app.post('/api/auth/resend-otp', async (req, res) => {
+  try {
+    const { email } = req.body;
+    const stored = otpStore.get('reg:' + email);
+    if (!stored) return res.status(400).json({error:'لا يوجد طلب تسجيل نشط — أعد التسجيل'});
+    const otp = generateOTP();
+    stored.otp = otp;
+    stored.exp = Date.now() + 10 * 60 * 1000;
+    otpStore.set('reg:' + email, stored);
+    await sendEmailOTP(email, otp, 'رمز تحقق جديد لتفعيل حسابك في WaslBot');
+    res.json({success:true, message:'تم إعادة إرسال الرمز'});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// ── VERIFY WHATSAPP NUMBER (send OTP via bot)
+app.post('/api/auth/verify-phone', authMiddleware, async (req, res) => {
+  try {
+    const { phoneNumberId, token, phoneToVerify } = req.body;
+    if (!phoneNumberId || !token || !phoneToVerify) return res.status(400).json({error:'بيانات ناقصة'});
+
+    const otp = generateOTP();
+    otpStore.set('phone:' + phoneNumberId, {
+      otp, exp: Date.now() + 10 * 60 * 1000,
+      accountId: req.account.id
+    });
+
+    // Send OTP via WhatsApp
+    await sendMessage(phoneNumberId, token, phoneToVerify,
+      `🔐 *رمز التحقق — WaslBot*
+
+رمزك هو: *${otp}*
+
+صالح لمدة 10 دقائق فقط.
+لا تشاركه مع أحد.`
+    );
+    res.json({success:true, message:'تم إرسال رمز التحقق عبر واتساب'});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// ── CONFIRM WHATSAPP OTP
+app.post('/api/auth/confirm-phone', authMiddleware, async (req, res) => {
+  try {
+    const { phoneNumberId, otp } = req.body;
+    const stored = otpStore.get('phone:' + phoneNumberId);
+    if (!stored) return res.status(400).json({error:'انتهت صلاحية الرمز'});
+    if (Date.now() > stored.exp) { otpStore.delete('phone:' + phoneNumberId); return res.status(400).json({error:'انتهت صلاحية الرمز'}); }
+    if (stored.otp !== otp.trim()) return res.status(400).json({error:'الرمز غير صحيح'});
+    if (stored.accountId !== req.account.id) return res.status(403).json({error:'غير مصرح'});
+    otpStore.delete('phone:' + phoneNumberId);
+    // Mark phone as verified
+    await supabase('phone_numbers','PATCH',{phone_verified:true},`?phone_number_id=eq.${phoneNumberId}`);
+    res.json({success:true, message:'تم التحقق من الرقم بنجاح ✅'});
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // ── ME
