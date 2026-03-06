@@ -147,9 +147,10 @@ app.post('/api/register', (req, res) => {
   if (clients[phoneNumberId]) {
     // Update existing
     clients[phoneNumberId].token = token;
+    if (waba_id) clients[phoneNumberId].waba_id = waba_id;
     if (defaultMsg) clients[phoneNumberId].defaultMsg = defaultMsg;
     if (aiEnabled !== undefined) clients[phoneNumberId].aiEnabled = aiEnabled;
-    if (businessContext) clients[phoneNumberId].businessContext = businessContext;
+    if (businessContext !== undefined) clients[phoneNumberId].businessContext = businessContext;
   } else {
     clients[phoneNumberId] = {
       token, waba_id, faqs: [], status: 'open',
@@ -184,6 +185,14 @@ app.post('/api/status', (req, res) => {
   if (closedMsg) clients[phoneNumberId].closedMsg = closedMsg;
   if (holidayMsg) clients[phoneNumberId].holidayMsg = holidayMsg;
   res.json({ success: true });
+});
+
+// Client Info API
+app.get('/api/client/:phoneNumberId', (req, res) => {
+  const client = clients[req.params.phoneNumberId];
+  if (!client) return res.status(404).json({ error: 'Client not found' });
+  const { token, ...safeClient } = client;
+  res.json(safeClient);
 });
 
 // Health Check
