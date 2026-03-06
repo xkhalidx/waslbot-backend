@@ -29,18 +29,31 @@ app.get('/webhook', (req, res) => {
 
 // Claude AI Reply
 async function getClaudeReply(userMessage, businessContext, faqs) {
-  const faqText = faqs.map(f => `السؤال: ${f.keywords}\nالجواب: ${f.answer}`).join('\n\n');
-  const prompt = `أنت مساعد ذكي لخدمة العملاء. أجب على رسائل العملاء بطريقة مهنية وودية باللغة العربية.
+  const faqText = faqs && faqs.length > 0
+    ? faqs.map(f => `• ${f.keywords}: ${f.answer}`).join('\n')
+    : 'لا توجد أسئلة مبرمجة';
 
-معلومات عن الشركة:
-${businessContext || 'شركة تجارية تقدم خدمات متميزة'}
+  const systemPrompt = `أنت مساعد ذكي لخدمة عملاء هذه الشركة. مهمتك الرد على العملاء بشكل مهني ودقيق.
 
+═══════════════════════════════
+معلومات الشركة:
+═══════════════════════════════
+${businessContext || 'لم يتم تحديد معلومات الشركة بعد'}
+
+═══════════════════════════════
 الأسئلة الشائعة المبرمجة:
-${faqText || 'لا توجد أسئلة مبرمجة'}
+═══════════════════════════════
+${faqText}
 
-رسالة العميل: ${userMessage}
-
-أجب بشكل مختصر ومفيد. إذا كان السؤال موجوداً في الأسئلة الشائعة استخدم نفس الجواب. إذا لم تعرف الجواب قل أنك ستحول السؤال للمختص.`;
+═══════════════════════════════
+قواعد الرد:
+═══════════════════════════════
+1. رد بنفس لغة العميل (عربي أو إنجليزي)
+2. كن مختصراً ومفيداً — لا تطول بدون فائدة
+3. إذا سأل عن سعر أو منتج موجود في المعلومات، أجب بدقة
+4. إذا السؤال خارج نطاق معلوماتك، قل: "سأحول سؤالك للمختص المسؤول"
+5. لا تخترع معلومات غير موجودة في السياق أعلاه
+6. إذا سأل عن الطلب أو الشراء، وجّهه للطريقة المذكورة في معلومات الشركة`;
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -51,10 +64,12 @@ ${faqText || 'لا توجد أسئلة مبرمجة'}
     },
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 300,
-      messages: [{ role: 'user', content: prompt }]
+      max_tokens: 400,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userMessage }]
     })
   });
+
   const data = await response.json();
   return data.content?.[0]?.text || null;
 }
@@ -145,7 +160,6 @@ app.post('/api/register', (req, res) => {
   const { phoneNumberId, token, waba_id, defaultMsg, aiEnabled, businessContext } = req.body;
   if (!phoneNumberId || !token) return res.status(400).json({ error: 'Missing fields' });
   if (clients[phoneNumberId]) {
-    // Update existing
     clients[phoneNumberId].token = token;
     if (waba_id) clients[phoneNumberId].waba_id = waba_id;
     if (defaultMsg) clients[phoneNumberId].defaultMsg = defaultMsg;
