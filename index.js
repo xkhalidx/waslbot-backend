@@ -877,6 +877,96 @@ app.post('/api/auth/confirm-phone', authMiddleware, async (req, res) => {
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
+// ── REQUEST PHONE OTP (العميل يضيف رقمه)
+app.post('/api/auth/request-phone-otp', authMiddleware, async (req, res) => {
+  try {
+    const { phone, label } = req.body;
+    if (!phone) return res.status(400).json({error:'رقم الواتساب مطلوب'});
+
+    // Check plan limits
+    const account = await db.getAccountById(req.account.id);
+    const existing = await db.getAccountPhones(req.account.id);
+    const limit = PLAN_LIMITS[account.plan] || 1;
+    if (existing.length >= limit)
+      return res.status(403).json({error:`باقتك (${account.plan}) تسمح بـ ${limit} رقم فقط — يرجى الترقية`});
+
+    // Get admin's phone number to send OTP from
+    // We use the platform's own WhatsApp number (from env) to send the OTP
+    const platformPhoneId = process.env.PLATFORM_PHONE_ID;
+    const platformToken   = process.env.PLATFORM_TOKEN;
+
+    const otp = generateOTP();
+    otpStore.set('addphone:' + req.account.id, {
+      otp,
+      exp: Date.now() + 10 * 60 * 1000,
+      phone,
+      label: label || ''
+    });
+
+    const msg = `🔐 *رمز التحقق — WaslBot*
+*Verification Code — WaslBot*
+
+رمزك السري هو:
+Your secret code is:
+
+*${otp}*
+
+⚠️ *تحذير مهم | Important Warning*
+
+🇸🇦 لا تشارك هذا الرمز مع أي شخص أبداً.
+WaslBot لن تطلب منك هذا الرمز عبر أي قناة أخرى.
+
+🇬🇧 Never share this code with anyone.
+WaslBot will never ask for this code through any other channel.
+
+⏱️ صالح 10 دقائق | Valid 10 minutes only`;
+
+    if (platformPhoneId && platformToken) {
+      await sendMessage(platformPhoneId, platformToken, phone, msg);
+    } else {
+      // Fallback: log OTP for testing
+      console.log(`[OTP for ${phone}]: ${otp}`);
+    }
+
+    res.json({success: true, message: 'تم إرسال رمز التحقق'});
+  } catch(e) { console.error('Request phone OTP error:', e); res.status(500).json({error: e.message}); }
+});
+
+// ── CONFIRM PHONE OTP (تأكيد رقم العميل)
+app.post('/api/auth/confirm-phone-otp', authMiddleware, async (req, res) => {
+  try {
+    const { phone, otp, label } = req.body;
+    if (!phone || !otp) return res.status(400).json({error:'بيانات ناقصة'});
+
+    const stored = otpStore.get('addphone:' + req.account.id);
+    if (!stored) return res.status(400).json({error:'انتهت صلاحية الرمز — أعد الطلب'});
+    if (Date.now() > stored.exp) {
+      otpStore.delete('addphone:' + req.account.id);
+      return res.status(400).json({error:'انتهت صلاحية الرمز'});
+    }
+    if (stored.otp !== otp.trim()) return res.status(400).json({error:'الرمز غير صحيح'});
+    if (stored.phone !== phone) return res.status(400).json({error:'رقم غير مطابق'});
+
+    otpStore.delete('addphone:' + req.account.id);
+
+    // Register phone with platform token (admin configures later)
+    const phoneRecord = {
+      phone_number_id: phone,  // temp: use phone as ID until admin links it
+      account_id:      req.account.id,
+      token:           process.env.PLATFORM_TOKEN || '',
+      label:           stored.label || label || '',
+      status:          'open',
+      ai_enabled:      false,
+      phone_verified:  true,
+      is_active:       true,
+      default_msg:     'شكراً لتواصلك! سنرد عليك قريباً 😊'
+    };
+
+    await db.upsertPhone(phoneRecord);
+    res.json({success: true, message: 'تم التحقق من الرقم وإضافته بنجاح ✅'});
+  } catch(e) { console.error('Confirm phone OTP error:', e); res.status(500).json({error: e.message}); }
+});
+
 // ── ME
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   try {
