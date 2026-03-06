@@ -115,14 +115,86 @@ const db = {
     const r = await supabase('accounts', 'GET', null, `?email=eq.${encodeURIComponent(email)}&limit=1`);
     return Array.isArray(r) ? r[0] : null;
   },
+  async getAccountById(id) {
+    const r = await supabase('accounts', 'GET', null, `?id=eq.${id}&limit=1`);
+    return Array.isArray(r) ? r[0] : null;
+  },
   async createAccount(data) {
     return supabase('accounts', 'POST', data);
   },
   async getAccountPhones(accountId) {
-    const r = await supabase('phone_numbers', 'GET', null, `?account_id=eq.${accountId}`);
+    const r = await supabase('phone_numbers', 'GET', null, `?account_id=eq.${accountId}&is_active=eq.true`);
     return Array.isArray(r) ? r : [];
+  },
+
+  // ── PLAN & MESSAGE LIMITS ──────────────────────────
+  async checkMessageLimit(accountId) {
+    const account = await db.getAccountById(accountId);
+    if (!account) return { allowed: false, reason: 'account_not_found' };
+
+    // Admin = unlimited
+    if (account.is_admin) return { allowed: true };
+
+    // Check plan expiry
+    if (account.plan_expires_at && new Date(account.plan_expires_at) < new Date()) {
+      return { allowed: false, reason: 'plan_expired' };
+    }
+
+    const used  = account.messages_used || 0;
+    const limit = account.messages_limit || PLAN_LIMITS_MSG[account.plan] || 1000;
+    const extra = account.extra_messages || 0;
+    const total = limit + extra;
+
+    if (used >= total) return { allowed: false, reason: 'limit_reached', used, total };
+    return { allowed: true, used, total, remaining: total - used };
+  },
+
+  async incrementMessageCount(accountId) {
+    const account = await db.getAccountById(accountId);
+    if (!account || account.is_admin) return;
+    const newCount = (account.messages_used || 0) + 1;
+    await supabase('accounts', 'PATCH',
+      { messages_used: newCount, updated_at: new Date().toISOString() },
+      `?id=eq.${accountId}`
+    );
+    // Track monthly usage
+    const month = new Date().toISOString().slice(0, 7) + '-01';
+    const phoneId = ''; // will be updated per call
+    try {
+      const existing = await supabase('message_usage', 'GET', null,
+        `?account_id=eq.${accountId}&month=eq.${month}&limit=1`
+      );
+      if (Array.isArray(existing) && existing[0]) {
+        await supabase('message_usage', 'PATCH',
+          { messages_count: existing[0].messages_count + 1 },
+          `?account_id=eq.${accountId}&month=eq.${month}`
+        );
+      } else {
+        await supabase('message_usage', 'POST',
+          { account_id: accountId, phone_number_id: phoneId, month, messages_count: 1 }
+        );
+      }
+    } catch(_) {}
+  },
+
+  async resetMonthlyIfNeeded(accountId) {
+    const account = await db.getAccountById(accountId);
+    if (!account) return;
+    const resetDate = account.billing_reset_date ? new Date(account.billing_reset_date) : new Date();
+    const now = new Date();
+    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    if (resetDate < currentMonthStart) {
+      await supabase('accounts', 'PATCH',
+        { messages_used: 0, billing_reset_date: currentMonthStart.toISOString().split('T')[0], updated_at: now.toISOString() },
+        `?id=eq.${accountId}`
+      );
+    }
   }
 };
+
+// ── PLAN LIMITS CONFIG ────────────────────────────────
+const PLAN_LIMITS_MSG = { basic: 1000, pro: 5000, enterprise: 20000 };
+const PLAN_PRICE = { basic: 99, pro: 249, enterprise: 599 };
 
 // ══════════════════════════════════════════════════════
 // TICKET COUNTER (in-memory fallback)
@@ -251,6 +323,40 @@ app.post('/webhook', async (req, res) => {
     // Load client from Supabase
     const client = await db.getPhone(phoneNumberId);
     if (!client || !client.is_active) return res.sendStatus(200);
+
+    // ── CHECK MESSAGE LIMIT ───────────────────────────────────────────────────
+    if (client.account_id) {
+      await db.resetMonthlyIfNeeded(client.account_id);
+      const limitCheck = await db.checkMessageLimit(client.account_id);
+      if (!limitCheck.allowed) {
+        if (limitCheck.reason === 'limit_reached') {
+          await sendMessage(phoneNumberId, client.token, from,
+            `⚠️ *تنبيه — WaslBot*
+
+عذراً، لقد استنفدت حد رسائلك الشهري (${limitCheck.total} رسالة).
+
+للاستمرار في الخدمة يرجى الترقية إلى باقة أعلى.
+🔗 waslbot.net`
+          );
+        } else if (limitCheck.reason === 'plan_expired') {
+          await sendMessage(phoneNumberId, client.token, from,
+            `⚠️ *تنبيه — WaslBot*
+
+انتهت صلاحية اشتراكك.
+يرجى تجديد الاشتراك للاستمرار.
+🔗 waslbot.net`
+          );
+        }
+        await db.incrementStat(phoneNumberId, 'messages_received');
+        return res.sendStatus(200);
+      }
+      // Count this message
+      await db.incrementMessageCount(client.account_id);
+      // Warn at 80% usage
+      if (limitCheck.remaining <= Math.floor(limitCheck.total * 0.2) && limitCheck.remaining > 0) {
+        console.log(`[LIMIT WARNING] Account ${client.account_id}: ${limitCheck.remaining} messages remaining`);
+      }
+    }
 
     // Load session
     const session = await db.getSession(phoneNumberId, from);
@@ -876,6 +982,95 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, async (req, res) =>
       active_phones:  Array.isArray(phones)?phones.length:0,
       open_tickets:   Array.isArray(tickets)?tickets.length:0
     });
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// ══════════════════════════════════════════════════════
+// HEALTH CHECK
+// ══════════════════════════════════════════════════════
+// USAGE & PLAN APIs
+// ══════════════════════════════════════════════════════
+
+// استهلاك الرسائل للحساب الحالي
+app.get('/api/my-usage', authMiddleware, async (req, res) => {
+  try {
+    const account = await db.getAccountById(req.account.id);
+    if (!account) return res.status(404).json({error:'Not found'});
+
+    await db.resetMonthlyIfNeeded(account.id);
+    const limit   = account.messages_limit || PLAN_LIMITS_MSG[account.plan] || 1000;
+    const used    = account.messages_used || 0;
+    const extra   = account.extra_messages || 0;
+    const total   = limit + extra;
+    const percent = Math.min(100, Math.round((used / total) * 100));
+
+    res.json({
+      plan:         account.plan,
+      messages_used:  used,
+      messages_limit: limit,
+      extra_messages: extra,
+      total_allowed:  total,
+      remaining:      Math.max(0, total - used),
+      percent_used:   percent,
+      reset_date:     account.billing_reset_date,
+      plan_expires_at: account.plan_expires_at
+    });
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// الباقات المتاحة
+app.get('/api/plans', async (req, res) => {
+  res.json({ plans: [
+    { id:'basic',      name:'Basic',      name_ar:'الأساسية',    price:99,  messages:1000,  phones:1, description:'مناسبة للمشاريع الصغيرة' },
+    { id:'pro',        name:'Pro',        name_ar:'الاحترافية',  price:249, messages:5000,  phones:3, description:'للمشاريع المتوسطة والنامية' },
+    { id:'enterprise', name:'Enterprise', name_ar:'المؤسسية',    price:599, messages:20000, phones:10,description:'للمؤسسات والشركات الكبيرة' }
+  ]});
+});
+
+// شراء رسائل إضافية
+app.post('/api/buy-extra', authMiddleware, async (req, res) => {
+  try {
+    const { quantity } = req.body; // كل وحدة = 500 رسالة بـ 10 ريال
+    if (!quantity || quantity < 1) return res.status(400).json({error:'الكمية غير صحيحة'});
+    const account = await db.getAccountById(req.account.id);
+    const added   = quantity * 500;
+    const amount  = quantity * 10;
+    await supabase('accounts','PATCH',
+      { extra_messages: (account.extra_messages||0) + added, updated_at: new Date().toISOString() },
+      `?id=eq.${account.id}`
+    );
+    // سجل الفاتورة
+    await supabase('invoices','POST',{
+      account_id:  account.id,
+      amount,
+      currency:    'SAR',
+      description: `${added} رسالة إضافية`,
+      status:      'pending'
+    });
+    res.json({ success:true, added, amount, message:`تم إضافة ${added} رسالة إضافية بقيمة ${amount} ريال` });
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// ── ADMIN: تغيير حد رسائل حساب معين
+app.post('/api/admin/accounts/:id/messages', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { messages_limit, extra_messages } = req.body;
+    const update = { updated_at: new Date().toISOString() };
+    if (messages_limit !== undefined) update.messages_limit = messages_limit;
+    if (extra_messages !== undefined) update.extra_messages = extra_messages;
+    await supabase('accounts','PATCH', update, `?id=eq.${req.params.id}`);
+    res.json({success:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// ── ADMIN: إعادة تعيين عداد رسائل حساب
+app.post('/api/admin/accounts/:id/reset-usage', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    await supabase('accounts','PATCH',
+      { messages_used: 0, updated_at: new Date().toISOString() },
+      `?id=eq.${req.params.id}`
+    );
+    res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
