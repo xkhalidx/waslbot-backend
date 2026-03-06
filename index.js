@@ -498,9 +498,32 @@ app.post('/api/tickets/:ticketId/close', async (req, res) => {
 // ══════════════════════════════════════════════════════
 // API: RELEASE HUMAN SESSION
 // ══════════════════════════════════════════════════════
+
+// تحرير عميل واحد
 app.post('/api/release/:phoneNumberId/:from', async (req, res) => {
   try {
     await db.updateSession(req.params.phoneNumberId, req.params.from, { transferred_to_human: false, waiting_for_transfer: false });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// جلب كل العملاء المحولين لبشري
+app.get('/api/human-sessions/:phoneNumberId', async (req, res) => {
+  try {
+    const r = await supabase('sessions', 'GET', null,
+      `?phone_number_id=eq.${req.params.phoneNumberId}&transferred_to_human=eq.true&order=updated_at.desc`
+    );
+    res.json({ sessions: Array.isArray(r) ? r : [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// تحرير كل العملاء المحولين دفعة واحدة
+app.post('/api/release-all/:phoneNumberId', async (req, res) => {
+  try {
+    await supabase('sessions', 'PATCH',
+      { transferred_to_human: false, waiting_for_transfer: false, updated_at: new Date().toISOString() },
+      `?phone_number_id=eq.${req.params.phoneNumberId}&transferred_to_human=eq.true`
+    );
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
