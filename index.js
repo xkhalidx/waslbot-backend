@@ -27,6 +27,38 @@ app.get('/webhook', (req, res) => {
   }
 });
 
+// Claude AI Reply
+async function getClaudeReply(userMessage, businessContext, faqs) {
+  const faqText = faqs.map(f => `السؤال: ${f.keywords}\nالجواب: ${f.answer}`).join('\n\n');
+  const prompt = `أنت مساعد ذكي لخدمة العملاء. أجب على رسائل العملاء بطريقة مهنية وودية باللغة العربية.
+
+معلومات عن الشركة:
+${businessContext || 'شركة تجارية تقدم خدمات متميزة'}
+
+الأسئلة الشائعة المبرمجة:
+${faqText || 'لا توجد أسئلة مبرمجة'}
+
+رسالة العميل: ${userMessage}
+
+أجب بشكل مختصر ومفيد. إذا كان السؤال موجوداً في الأسئلة الشائعة استخدم نفس الجواب. إذا لم تعرف الجواب قل أنك ستحول السؤال للمختص.`;
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }]
+    })
+  });
+  const data = await response.json();
+  return data.content?.[0]?.text || null;
+}
+
 // Receive Messages
 app.post('/webhook', async (req, res) => {
   try {
@@ -39,32 +71,54 @@ app.post('/webhook', async (req, res) => {
     if (!message) return res.sendStatus(200);
     const from = message.from;
     const phoneNumberId = value.metadata.phone_number_id;
-    const text = message.text?.body?.toLowerCase() || '';
+    const text = message.text?.body || '';
     console.log('Message from ' + from + ': ' + text);
     const client = clients[phoneNumberId];
     if (!client) return res.sendStatus(200);
+
+    // Check business status
     if (client.status === 'closed') {
-      await sendMessage(phoneNumberId, client.token, from, client.closedMsg || "We're currently closed. We'll reply soon!");
+      await sendMessage(phoneNumberId, client.token, from, client.closedMsg || "نحن مغلقون حالياً. سنرد عليك قريباً ⏰");
       return res.sendStatus(200);
     }
     if (client.status === 'holiday') {
-      await sendMessage(phoneNumberId, client.token, from, client.holidayMsg || "We're on holiday. We'll be back soon!");
+      await sendMessage(phoneNumberId, client.token, from, client.holidayMsg || "نحن في إجازة. سنعود قريباً 🏖");
       return res.sendStatus(200);
     }
+
     const faqs = client.faqs || [];
+    const textLower = text.toLowerCase();
+
+    // Check FAQs first
     let replied = false;
     for (const faq of faqs) {
       const keywords = (faq.keywords || '').toLowerCase().split(',').map(k => k.trim());
-      const matched = keywords.some(k => k && text.includes(k));
+      const matched = keywords.some(k => k && textLower.includes(k));
       if (matched) {
         await sendMessage(phoneNumberId, client.token, from, faq.answer);
         replied = true;
         break;
       }
     }
+
+    // If no FAQ match - use Claude AI if enabled
     if (!replied) {
-      await sendMessage(phoneNumberId, client.token, from, client.defaultMsg || "Thanks for your message! We'll get back to you soon.");
+      if (client.aiEnabled && process.env.ANTHROPIC_API_KEY) {
+        try {
+          const aiReply = await getClaudeReply(text, client.businessContext, faqs);
+          if (aiReply) {
+            await sendMessage(phoneNumberId, client.token, from, aiReply);
+            replied = true;
+          }
+        } catch(e) {
+          console.error('Claude error:', e.message);
+        }
+      }
+      if (!replied) {
+        await sendMessage(phoneNumberId, client.token, from, client.defaultMsg || "شكراً لتواصلك! سنرد عليك قريباً 😊");
+      }
     }
+
     res.sendStatus(200);
   } catch (err) {
     console.error('Webhook error:', err);
@@ -82,16 +136,29 @@ async function sendMessage(phoneNumberId, token, to, text) {
     body: JSON.stringify(body)
   });
   const data = await res.json();
-  console.log('Sent:', data);
+  console.log('Sent:', JSON.stringify(data));
   return data;
 }
 
 // Client Registration API
 app.post('/api/register', (req, res) => {
-  const { phoneNumberId, token, waba_id } = req.body;
+  const { phoneNumberId, token, waba_id, defaultMsg, aiEnabled, businessContext } = req.body;
   if (!phoneNumberId || !token) return res.status(400).json({ error: 'Missing fields' });
-  clients[phoneNumberId] = { token, waba_id, faqs: [], status: 'open', defaultMsg: "Thanks for your message! We'll get back to you soon." };
-  console.log('Client registered:', phoneNumberId);
+  if (clients[phoneNumberId]) {
+    // Update existing
+    clients[phoneNumberId].token = token;
+    if (defaultMsg) clients[phoneNumberId].defaultMsg = defaultMsg;
+    if (aiEnabled !== undefined) clients[phoneNumberId].aiEnabled = aiEnabled;
+    if (businessContext) clients[phoneNumberId].businessContext = businessContext;
+  } else {
+    clients[phoneNumberId] = {
+      token, waba_id, faqs: [], status: 'open',
+      defaultMsg: defaultMsg || "شكراً لتواصلك! سنرد عليك قريباً 😊",
+      aiEnabled: aiEnabled || false,
+      businessContext: businessContext || ''
+    };
+  }
+  console.log('Client registered:', phoneNumberId, '| AI:', clients[phoneNumberId].aiEnabled);
   res.json({ success: true, message: 'Client registered!' });
 });
 
