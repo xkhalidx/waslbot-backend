@@ -239,7 +239,6 @@ async function sendMessage(phoneNumberId, token, to, text) {
 // NOTIFY OWNER
 // ══════════════════════════════════════════════════════
 async function notifyOwner(client, phoneNumberId, prefs, type, message) {
-  // Check if this notification type is enabled
   const typeMap = {
     ticket: 'notify_new_ticket',
     transfer: 'notify_transfer_request',
@@ -253,7 +252,7 @@ async function notifyOwner(client, phoneNumberId, prefs, type, message) {
     try { await sendMessage(phoneNumberId, client.token, client.notify_phone, message); } catch (e) { console.error('Owner WA error:', e.message); }
   }
   if (prefs.via_email && client.notify_email) {
-    console.log('Email to:', client.notify_email, '|', message); // hook your email API here
+    console.log('Email to:', client.notify_email, '|', message);
   }
 }
 
@@ -320,7 +319,6 @@ app.post('/webhook', async (req, res) => {
 
     console.log(`[${phoneNumberId}] From ${from}: ${text}`);
 
-    // Load client from Supabase
     const client = await db.getPhone(phoneNumberId);
     if (!client || !client.is_active) return res.sendStatus(200);
 
@@ -331,34 +329,22 @@ app.post('/webhook', async (req, res) => {
       if (!limitCheck.allowed) {
         if (limitCheck.reason === 'limit_reached') {
           await sendMessage(phoneNumberId, client.token, from,
-            `⚠️ *تنبيه — WaslBot*
-
-عذراً، لقد استنفدت حد رسائلك الشهري (${limitCheck.total} رسالة).
-
-للاستمرار في الخدمة يرجى الترقية إلى باقة أعلى.
-🔗 waslbot.net`
+            `⚠️ *تنبيه — WaslBot*\n\nعذراً، لقد استنفدت حد رسائلك الشهري (${limitCheck.total} رسالة).\n\nللاستمرار في الخدمة يرجى الترقية إلى باقة أعلى.\n🔗 waslbot.net`
           );
         } else if (limitCheck.reason === 'plan_expired') {
           await sendMessage(phoneNumberId, client.token, from,
-            `⚠️ *تنبيه — WaslBot*
-
-انتهت صلاحية اشتراكك.
-يرجى تجديد الاشتراك للاستمرار.
-🔗 waslbot.net`
+            `⚠️ *تنبيه — WaslBot*\n\nانتهت صلاحية اشتراكك.\nيرجى تجديد الاشتراك للاستمرار.\n🔗 waslbot.net`
           );
         }
         await db.incrementStat(phoneNumberId, 'messages_received');
         return res.sendStatus(200);
       }
-      // Count this message
       await db.incrementMessageCount(client.account_id);
-      // Warn at 80% usage
       if (limitCheck.remaining <= Math.floor(limitCheck.total * 0.2) && limitCheck.remaining > 0) {
         console.log(`[LIMIT WARNING] Account ${client.account_id}: ${limitCheck.remaining} messages remaining`);
       }
     }
 
-    // Load session
     const session = await db.getSession(phoneNumberId, from);
     const prefs   = await db.getNotifPrefs(phoneNumberId);
 
@@ -604,8 +590,6 @@ app.post('/api/tickets/:ticketId/close', async (req, res) => {
 // ══════════════════════════════════════════════════════
 // API: RELEASE HUMAN SESSION
 // ══════════════════════════════════════════════════════
-
-// تحرير عميل واحد
 app.post('/api/release/:phoneNumberId/:from', async (req, res) => {
   try {
     await db.updateSession(req.params.phoneNumberId, req.params.from, { transferred_to_human: false, waiting_for_transfer: false });
@@ -613,7 +597,6 @@ app.post('/api/release/:phoneNumberId/:from', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// جلب كل العملاء المحولين لبشري
 app.get('/api/human-sessions/:phoneNumberId', async (req, res) => {
   try {
     const r = await supabase('sessions', 'GET', null,
@@ -623,7 +606,6 @@ app.get('/api/human-sessions/:phoneNumberId', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// تحرير كل العملاء المحولين دفعة واحدة
 app.post('/api/release-all/:phoneNumberId', async (req, res) => {
   try {
     await supabase('sessions', 'PATCH',
@@ -713,8 +695,7 @@ function adminMiddleware(req, res, next) {
 }
 
 // ── OTP HELPERS ─────────────────────────────────────
-// Store OTPs in memory (expires in 10 min)
-const otpStore = new Map(); // key: email|phone → {otp, exp, data}
+const otpStore = new Map();
 
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
@@ -784,7 +765,6 @@ app.post('/api/auth/verify-email', async (req, res) => {
     otpStore.delete('reg:' + email);
     const { data: regData } = stored;
 
-    // Create account
     const existing = await db.getAccount(email);
     let account;
     if (existing) {
@@ -836,7 +816,7 @@ app.post('/api/auth/resend-otp', async (req, res) => {
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
-// ── VERIFY WHATSAPP NUMBER (send OTP via bot)
+// ── VERIFY WHATSAPP NUMBER
 app.post('/api/auth/verify-phone', authMiddleware, async (req, res) => {
   try {
     const { phoneNumberId, token, phoneToVerify } = req.body;
@@ -848,14 +828,8 @@ app.post('/api/auth/verify-phone', authMiddleware, async (req, res) => {
       accountId: req.account.id
     });
 
-    // Send OTP via WhatsApp
     await sendMessage(phoneNumberId, token, phoneToVerify,
-      `🔐 *رمز التحقق — WaslBot*
-
-رمزك هو: *${otp}*
-
-صالح لمدة 10 دقائق فقط.
-لا تشاركه مع أحد.`
+      `🔐 *رمز التحقق — WaslBot*\n\nرمزك هو: *${otp}*\n\nصالح لمدة 10 دقائق فقط.\nلا تشاركه مع أحد.`
     );
     res.json({success:true, message:'تم إرسال رمز التحقق عبر واتساب'});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -871,27 +845,23 @@ app.post('/api/auth/confirm-phone', authMiddleware, async (req, res) => {
     if (stored.otp !== otp.trim()) return res.status(400).json({error:'الرمز غير صحيح'});
     if (stored.accountId !== req.account.id) return res.status(403).json({error:'غير مصرح'});
     otpStore.delete('phone:' + phoneNumberId);
-    // Mark phone as verified
     await supabase('phone_numbers','PATCH',{phone_verified:true},`?phone_number_id=eq.${phoneNumberId}`);
     res.json({success:true, message:'تم التحقق من الرقم بنجاح ✅'});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
-// ── REQUEST PHONE OTP (العميل يضيف رقمه)
+// ── REQUEST PHONE OTP
 app.post('/api/auth/request-phone-otp', authMiddleware, async (req, res) => {
   try {
     const { phone, label } = req.body;
     if (!phone) return res.status(400).json({error:'رقم الواتساب مطلوب'});
 
-    // Check plan limits
     const account = await db.getAccountById(req.account.id);
     const existing = await db.getAccountPhones(req.account.id);
     const limit = PLAN_LIMITS[account.plan] || 1;
     if (existing.length >= limit)
       return res.status(403).json({error:`باقتك (${account.plan}) تسمح بـ ${limit} رقم فقط — يرجى الترقية`});
 
-    // Get admin's phone number to send OTP from
-    // We use the platform's own WhatsApp number (from env) to send the OTP
     const platformPhoneId = process.env.PLATFORM_PHONE_ID;
     const platformToken   = process.env.PLATFORM_TOKEN;
 
@@ -903,28 +873,11 @@ app.post('/api/auth/request-phone-otp', authMiddleware, async (req, res) => {
       label: label || ''
     });
 
-    const msg = `🔐 *رمز التحقق — WaslBot*
-*Verification Code — WaslBot*
-
-رمزك السري هو:
-Your secret code is:
-
-*${otp}*
-
-⚠️ *تحذير مهم | Important Warning*
-
-🇸🇦 لا تشارك هذا الرمز مع أي شخص أبداً.
-WaslBot لن تطلب منك هذا الرمز عبر أي قناة أخرى.
-
-🇬🇧 Never share this code with anyone.
-WaslBot will never ask for this code through any other channel.
-
-⏱️ صالح 10 دقائق | Valid 10 minutes only`;
+    const msg = `🔐 *رمز التحقق — WaslBot*\n*Verification Code — WaslBot*\n\nرمزك السري هو:\nYour secret code is:\n\n*${otp}*\n\n⚠️ *تحذير مهم | Important Warning*\n\n🇸🇦 لا تشارك هذا الرمز مع أي شخص أبداً.\nWaslBot لن تطلب منك هذا الرمز عبر أي قناة أخرى.\n\n🇬🇧 Never share this code with anyone.\nWaslBot will never ask for this code through any other channel.\n\n⏱️ صالح 10 دقائق | Valid 10 minutes only`;
 
     if (platformPhoneId && platformToken) {
       await sendMessage(platformPhoneId, platformToken, phone, msg);
     } else {
-      // Fallback: log OTP for testing
       console.log(`[OTP for ${phone}]: ${otp}`);
     }
 
@@ -932,7 +885,7 @@ WaslBot will never ask for this code through any other channel.
   } catch(e) { console.error('Request phone OTP error:', e); res.status(500).json({error: e.message}); }
 });
 
-// ── CONFIRM PHONE OTP (تأكيد رقم العميل)
+// ── CONFIRM PHONE OTP
 app.post('/api/auth/confirm-phone-otp', authMiddleware, async (req, res) => {
   try {
     const { phone, otp, label } = req.body;
@@ -949,9 +902,8 @@ app.post('/api/auth/confirm-phone-otp', authMiddleware, async (req, res) => {
 
     otpStore.delete('addphone:' + req.account.id);
 
-    // Register phone with platform token (admin configures later)
     const phoneRecord = {
-      phone_number_id: phone,  // temp: use phone as ID until admin links it
+      phone_number_id: phone,
       account_id:      req.account.id,
       token:           process.env.PLATFORM_TOKEN || '',
       label:           stored.label || label || '',
@@ -1076,12 +1028,8 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, async (req, res) =>
 });
 
 // ══════════════════════════════════════════════════════
-// HEALTH CHECK
-// ══════════════════════════════════════════════════════
 // USAGE & PLAN APIs
 // ══════════════════════════════════════════════════════
-
-// استهلاك الرسائل للحساب الحالي
 app.get('/api/my-usage', authMiddleware, async (req, res) => {
   try {
     const account = await db.getAccountById(req.account.id);
@@ -1108,7 +1056,6 @@ app.get('/api/my-usage', authMiddleware, async (req, res) => {
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
-// الباقات المتاحة
 app.get('/api/plans', async (req, res) => {
   res.json({ plans: [
     { id:'basic',      name:'Basic',      name_ar:'الأساسية',    price:99,  messages:1000,  phones:1, description:'مناسبة للمشاريع الصغيرة' },
@@ -1117,10 +1064,9 @@ app.get('/api/plans', async (req, res) => {
   ]});
 });
 
-// شراء رسائل إضافية
 app.post('/api/buy-extra', authMiddleware, async (req, res) => {
   try {
-    const { quantity } = req.body; // كل وحدة = 500 رسالة بـ 10 ريال
+    const { quantity } = req.body;
     if (!quantity || quantity < 1) return res.status(400).json({error:'الكمية غير صحيحة'});
     const account = await db.getAccountById(req.account.id);
     const added   = quantity * 500;
@@ -1129,7 +1075,6 @@ app.post('/api/buy-extra', authMiddleware, async (req, res) => {
       { extra_messages: (account.extra_messages||0) + added, updated_at: new Date().toISOString() },
       `?id=eq.${account.id}`
     );
-    // سجل الفاتورة
     await supabase('invoices','POST',{
       account_id:  account.id,
       amount,
@@ -1141,7 +1086,6 @@ app.post('/api/buy-extra', authMiddleware, async (req, res) => {
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
-// ── ADMIN: تغيير حد رسائل حساب معين
 app.post('/api/admin/accounts/:id/messages', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { messages_limit, extra_messages } = req.body;
@@ -1153,7 +1097,6 @@ app.post('/api/admin/accounts/:id/messages', authMiddleware, adminMiddleware, as
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
-// ── ADMIN: إعادة تعيين عداد رسائل حساب
 app.post('/api/admin/accounts/:id/reset-usage', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     await supabase('accounts','PATCH',
@@ -1175,6 +1118,19 @@ app.get('/', async (req, res) => {
     version: '3.0.0'
   });
 });
+
+// ══════════════════════════════════════════════════════
+// KEEP ALIVE - prevent Render sleep
+// ══════════════════════════════════════════════════════
+const BACKEND_URL = process.env.RENDER_EXTERNAL_URL || 'https://waslbot-backend.onrender.com';
+setInterval(async () => {
+  try {
+    await fetch(BACKEND_URL + '/');
+    console.log('[KeepAlive] ping sent');
+  } catch (e) {
+    console.error('[KeepAlive] ping failed:', e.message);
+  }
+}, 4 * 60 * 1000); // كل 4 دقائق
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`WaslBot v3 running on port ${PORT}`));
